@@ -6,7 +6,7 @@ import torch
 import numpy as np
 
 from models.losses import FocalLoss
-from models.losses import RegL1Loss, RegLoss, NormRegL1Loss, RegWeightedL1Loss
+from models.losses import RegL1Loss, RegLoss, NormRegL1Loss, RegWeightedL1Loss, IoULoss
 from models.decode import ctdet_decode
 from models.utils import _sigmoid
 from utils.debugger import Debugger
@@ -17,17 +17,21 @@ from .base_trainer import BaseTrainer
 class CtdetLoss(torch.nn.Module):
   def __init__(self, opt):
     super(CtdetLoss, self).__init__()
-    self.crit = torch.nn.MSELoss() if opt.mse_loss else FocalLoss()
+    self.crit = torch.nn.MSELoss() if opt.mse_loss else FocalLoss(opt)
     self.crit_reg = RegL1Loss() if opt.reg_loss == 'l1' else \
               RegLoss() if opt.reg_loss == 'sl1' else None
     self.crit_wh = torch.nn.L1Loss(reduction='sum') if opt.dense_wh else \
               NormRegL1Loss() if opt.norm_wh else \
               RegWeightedL1Loss() if opt.cat_spec_wh else self.crit_reg
+    self.crit_local = IoULoss(opt.local, opt) if opt.local in ['iou', 'giou'] else None 
     self.opt = opt
 
   def forward(self, outputs, batch):
     opt = self.opt
-    hm_loss, wh_loss, off_loss = 0, 0, 0
+    if opt.local in ['iou', 'giou'] : 
+      hm_loss, wh_loss, off_loss, local_loss = 0, 0, 0, 0
+    else : 
+      hm_loss, wh_loss, off_loss = 0, 0, 0
     for s in range(opt.num_stacks):
       output = outputs[s]
       if not opt.mse_loss:
@@ -47,30 +51,43 @@ class CtdetLoss(torch.nn.Module):
           output['reg'].shape[3], output['reg'].shape[2])).to(opt.device)
 
       hm_loss += self.crit(output['hm'], batch['hm']) / opt.num_stacks
-      if opt.wh_weight > 0:
-        if opt.dense_wh:
-          mask_weight = batch['dense_wh_mask'].sum() + 1e-4
-          wh_loss += (
-            self.crit_wh(output['wh'] * batch['dense_wh_mask'],
-            batch['dense_wh'] * batch['dense_wh_mask']) / 
-            mask_weight) / opt.num_stacks
-        elif opt.cat_spec_wh:
-          wh_loss += self.crit_wh(
-            output['wh'], batch['cat_spec_mask'],
-            batch['ind'], batch['cat_spec_wh']) / opt.num_stacks
-        else:
-          wh_loss += self.crit_reg(
-            output['wh'], batch['reg_mask'],
-            batch['ind'], batch['wh']) / opt.num_stacks
-      
-      if opt.reg_offset and opt.off_weight > 0:
-        off_loss += self.crit_reg(output['reg'], batch['reg_mask'],
-                             batch['ind'], batch['reg']) / opt.num_stacks
+      if opt.local in ['iou', 'giou'] : 
+        local_loss += self.crit_local(output['wh'], output['reg'],
+                                      batch['reg_mask'], batch['ind'], batch['wh'], batch['reg']) / opt.num_stacks
+        if opt.with_origin_local : 
+          wh_loss += self.crit_reg(output['wh'], batch['reg_mask'], batch['ind'], batch['wh']) / opt.num_stacks
+          off_loss += self.crit_reg(output['reg'], batch['reg_mask'], batch['ind'], batch['reg']) / opt.num_stacks
+      else : 
+        if opt.wh_weight > 0:
+          if opt.dense_wh:
+            mask_weight = batch['dense_wh_mask'].sum() + 1e-4
+            wh_loss += (
+              self.crit_wh(output['wh'] * batch['dense_wh_mask'],
+              batch['dense_wh'] * batch['dense_wh_mask']) / 
+              mask_weight) / opt.num_stacks
+          elif opt.cat_spec_wh:
+            wh_loss += self.crit_wh(
+              output['wh'], batch['cat_spec_mask'],
+              batch['ind'], batch['cat_spec_wh']) / opt.num_stacks
+          else:
+            wh_loss += self.crit_reg(
+              output['wh'], batch['reg_mask'],
+              batch['ind'], batch['wh']) / opt.num_stacks
         
-    loss = opt.hm_weight * hm_loss + opt.wh_weight * wh_loss + \
-           opt.off_weight * off_loss
-    loss_stats = {'loss': loss, 'hm_loss': hm_loss,
-                  'wh_loss': wh_loss, 'off_loss': off_loss}
+        if opt.reg_offset and opt.off_weight > 0:
+          off_loss += self.crit_reg(output['reg'], batch['reg_mask'],
+                              batch['ind'], batch['reg']) / opt.num_stacks
+    
+    if opt.local in ['iou', 'giou'] : 
+      loss = opt.hm_weight * hm_loss + opt.local_weight * local_loss
+      loss_stats = {'loss': loss, 'hm_loss': hm_loss, 'local_loss': local_loss}
+      if opt.with_origin_local : 
+        loss += opt.wh_weight * wh_loss + opt.off_weight * off_loss
+        loss_stats['wh_loss'] = wh_loss
+        loss_stats['off_loss'] = off_loss
+    else : 
+      loss = opt.hm_weight * hm_loss + opt.wh_weight * wh_loss + opt.off_weight * off_loss
+      loss_stats = {'loss': loss, 'hm_loss': hm_loss, 'wh_loss': wh_loss, 'off_loss': off_loss}
     return loss, loss_stats
 
 class CtdetTrainer(BaseTrainer):
@@ -79,6 +96,11 @@ class CtdetTrainer(BaseTrainer):
   
   def _get_losses(self, opt):
     loss_states = ['loss', 'hm_loss', 'wh_loss', 'off_loss']
+    if opt.local in ['iou', 'giou'] : 
+      if not opt.with_origin_local:
+        loss_states.remove('wh_loss')
+        loss_states.remove('off_loss')
+      loss_states += ['local_loss']
     loss = CtdetLoss(opt)
     return loss_states, loss
 
