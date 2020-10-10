@@ -109,3 +109,8 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+# run shell file 
+*.sh 
+/data/*
+exp
