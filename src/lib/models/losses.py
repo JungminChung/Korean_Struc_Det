@@ -39,22 +39,37 @@ def _slow_neg_loss(pred, gt):
   return loss
 
 
-def _neg_loss(pred, gt):
+def _neg_loss(pred, gt, smoothing=0):
   ''' Modified focal loss. Exactly the same as CornerNet.
       Runs faster and costs a little bit more memory
     Arguments:
       pred (batch x c x h x w)
       gt_regr (batch x c x h x w)
   '''
-  pos_inds = gt.eq(1).float()
-  neg_inds = gt.lt(1).float()
+  max_val = 1
+  min_val = 0
 
-  neg_weights = torch.pow(1 - gt, 4)
+  if smoothing > 0:
+    conf = 1 - smoothing
+    num_cls = gt.shape[1]
+
+    max_val = conf
+    min_val = smoothing / (num_cls - 1)
+
+    gt = torch.where(gt > 0, torch.mul(gt, conf), torch.mul(torch.ones_like(gt), min_val))
+
+  pos_inds = gt.eq(max_val).float()
+  neg_inds = gt.lt(max_val).float()
+
+  neg_weights = torch.pow(max_val - gt, 4)
 
   loss = 0
-
-  pos_loss = torch.log(pred) * torch.pow(1 - pred, 2) * pos_inds
-  neg_loss = torch.log(1 - pred) * torch.pow(pred, 2) * neg_weights * neg_inds
+  pos_loss = torch.log(torch.clamp(1 - torch.abs(max_val - pred), min=1e-5)) \
+              * torch.pow(torch.abs(max_val - pred), 2) \
+              * pos_inds 
+  neg_loss = torch.log(torch.clamp(1 - torch.abs(pred - min_val), min=1e-5)) \
+              * torch.pow(torch.abs(pred - min_val), 2) \
+              * neg_weights * neg_inds 
 
   num_pos  = pos_inds.float().sum()
   pos_loss = pos_loss.sum()
@@ -113,12 +128,13 @@ def _reg_loss(regr, gt_regr, mask):
 
 class FocalLoss(nn.Module):
   '''nn.Module warpper for focal loss'''
-  def __init__(self):
+  def __init__(self, opt):
     super(FocalLoss, self).__init__()
     self.neg_loss = _neg_loss
+    self.smoothing = opt.smoothing
 
   def forward(self, out, target):
-    return self.neg_loss(out, target)
+    return self.neg_loss(out, target, smoothing=self.smoothing)
 
 class RegLoss(nn.Module):
   '''Regression loss for an output tensor
@@ -235,3 +251,72 @@ def compute_rot_loss(output, target_bin, target_res, mask):
           valid_output2[:, 7], torch.cos(valid_target_res2[:, 1]))
         loss_res += loss_sin2 + loss_cos2
     return loss_bin1 + loss_bin2 + loss_res
+
+class IoULoss(nn.Module):
+    def __init__(self, method, opt):
+        super(IoULoss, self).__init__()
+        self.method = method
+
+    def forward(self, output_wh, output_reg, target_reg_mask, target_ind, target_wh, target_reg):
+        height, width = output_wh.size(2), output_wh.size(3)
+
+        xs = torch.remainder(target_ind, width) 
+        ys = target_ind // width 
+
+        output_wh = _transpose_and_gather_feat(output_wh, target_ind)  
+        output_reg = _transpose_and_gather_feat(output_reg, target_ind)  
+
+        output_bboxes = torch.cat([(xs + output_reg[..., 0] - output_wh[..., 0] / 2).unsqueeze(-1),
+                                   (ys + output_reg[..., 1] - output_wh[..., 1] / 2).unsqueeze(-1),
+                                   (xs + output_reg[..., 0] + output_wh[..., 0] / 2).unsqueeze(-1),
+                                   (ys + output_reg[..., 1] + output_wh[..., 1] / 2).unsqueeze(-1)], dim=2)
+        output_bboxes = output_bboxes[target_reg_mask.bool()] 
+
+        target_bboxes = torch.cat([(xs + target_reg[..., 0] - target_wh[..., 0] / 2).unsqueeze(-1),
+                                   (ys + target_reg[..., 1] - target_wh[..., 1] / 2).unsqueeze(-1),
+                                   (xs + target_reg[..., 0] + target_wh[..., 0] / 2).unsqueeze(-1),
+                                   (ys + target_reg[..., 1] + target_wh[..., 1] / 2).unsqueeze(-1)], dim=2)
+        target_bboxes = target_bboxes[target_reg_mask.bool()]  
+
+        loss = self.compute_loss(output_bboxes, target_bboxes) / (target_reg_mask.sum() + 1e-4)
+        return loss
+
+    def compute_loss(self, output, target):
+        x1, y1, x2, y2 = self.transform_bbox(output)
+        x1g, y1g, x2g, y2g = self.transform_bbox(target)
+
+        area_output = (x2 - x1) * (y2 - y1)
+        area_target = (x2g - x1g) * (y2g - y1g)
+
+        x1i = torch.max(x1, x1g)
+        x2i = torch.min(x2, x2g)
+        y1i = torch.max(y1, y1g)
+        y2i = torch.min(y2, y2g)
+
+        area_inter = torch.zeros_like(x1i)
+        inter_mask = (x2i > x1i) * (y2i > y1i)
+        area_inter[inter_mask] = (x2i[inter_mask] - x1i[inter_mask]) * (y2i[inter_mask] - y1i[inter_mask])
+
+        area_union = area_output + area_target - area_inter + 1e-7
+        iou = area_inter / area_union
+        base = iou
+
+        if self.method == 'giou':
+            x1c = torch.min(x1, x1g)
+            x2c = torch.max(x2, x2g)
+            y1c = torch.min(y1, y1g)
+            y2c = torch.max(y2, y2g)
+
+            area_c = (x2c - x1c) * (y2c - y1c) + 1e-7
+
+            giou = iou - (torch.abs(area_c - area_union) / torch.abs(area_c))
+            base = giou
+
+        loss = torch.ones_like(base) - base
+
+        return loss.sum()
+
+    def transform_bbox(self, bbox):
+        x1, y1, x2, y2 = bbox[:, 0], bbox[:, 1], bbox[:, 2], bbox[:, 3]
+        x1, y1, x2, y2 = x1.view(-1), y1.view(-1), x2.view(-1), y2.view(-1)
+        return x1, y1, x2, y2
