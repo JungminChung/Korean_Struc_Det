@@ -10,10 +10,16 @@ class opts(object):
   def __init__(self):
     self.parser = argparse.ArgumentParser()
     # basic experiment setting
-    self.parser.add_argument('task', default='ctdet',
-                             help='ctdet | ddd | multi_pose | exdet')
-    self.parser.add_argument('--dataset', default='coco',
-                             help='coco | kitti | coco_hp | pascal')
+    self.parser.add_argument('task', default='ctdet')
+    self.parser.add_argument('--dataset', default='korea_structure')
+    self.parser.add_argument('--data_dir', default='',
+                             help='path/to/dataset')
+    self.parser.add_argument('--json_dir', default='',
+                             help='path/to/annotation')
+    self.parser.add_argument('--eval_json_dir', default='',
+                             help='path/to/eval/annotation')
+    self.parser.add_argument('--save_folder_name', default='',
+                             help='save folder name')
     self.parser.add_argument('--exp_id', default='default')
     self.parser.add_argument('--test', action='store_true')
     self.parser.add_argument('--debug', type=int, default=0,
@@ -152,6 +158,14 @@ class opts(object):
     self.parser.add_argument('--mse_loss', action='store_true',
                              help='use mse loss or focal loss to train '
                                   'keypoint heatmaps.')
+    self.parser.add_argument('--local', type=str, default='',
+                             help='use iou or giou for localization loss. options : iou | giou')
+    self.parser.add_argument('--local_weight', type=float, default=1,
+                             help='loss weight for local loss.')
+    self.parser.add_argument('--with_origin_local', action='store_true',
+                             help='if true, calc iou(or giou) loss with original centernets wh and offset loss')
+    self.parser.add_argument('--smoothing', type=float, default=0.0,
+                             help='focal loss label smoothing param')
     # ctdet
     self.parser.add_argument('--reg_loss', default='l1',
                              help='regression loss: sl1 | l1 | l2')
@@ -269,9 +283,14 @@ class opts(object):
     print('training chunk_sizes:', opt.chunk_sizes)
 
     opt.root_dir = os.path.join(os.path.dirname(__file__), '..', '..')
-    opt.data_dir = os.path.join(opt.root_dir, 'data')
+    opt.data_dir = os.path.join(opt.data_dir)
     opt.exp_dir = os.path.join(opt.root_dir, 'exp', opt.task)
-    opt.save_dir = os.path.join(opt.exp_dir, opt.exp_id)
+    if opt.eval_json_dir == '': 
+      opt.eval_json_dir = opt.json_dir
+    if opt.save_folder_name == '':
+      opt.save_dir = os.path.join(opt.exp_dir, opt.exp_id, opt.dataset)
+    else : 
+      opt.save_dir = os.path.join(opt.exp_dir, opt.exp_id, opt.dataset, opt.save_folder_name)
     opt.debug_dir = os.path.join(opt.save_dir, 'debug')
     print('The output will be saved to ', opt.save_dir)
     
@@ -335,21 +354,9 @@ class opts(object):
 
   def init(self, args=''):
     default_dataset_info = {
-      'ctdet': {'default_resolution': [512, 512], 'num_classes': 80, 
+      'ctdet': {'default_resolution': [512, 512], 'num_classes': 80,  ## TODO
                 'mean': [0.408, 0.447, 0.470], 'std': [0.289, 0.274, 0.278],
-                'dataset': 'coco'},
-      'exdet': {'default_resolution': [512, 512], 'num_classes': 80, 
-                'mean': [0.408, 0.447, 0.470], 'std': [0.289, 0.274, 0.278],
-                'dataset': 'coco'},
-      'multi_pose': {
-        'default_resolution': [512, 512], 'num_classes': 1, 
-        'mean': [0.408, 0.447, 0.470], 'std': [0.289, 0.274, 0.278],
-        'dataset': 'coco_hp', 'num_joints': 17,
-        'flip_idx': [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], 
-                     [11, 12], [13, 14], [15, 16]]},
-      'ddd': {'default_resolution': [384, 1280], 'num_classes': 3, 
-                'mean': [0.485, 0.456, 0.406], 'std': [0.229, 0.224, 0.225],
-                'dataset': 'kitti'},
+                'dataset': 'korea_structure'},
     }
     class Struct:
       def __init__(self, entries):
